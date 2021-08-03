@@ -4,6 +4,10 @@
 #include <wtsapi32.h>
 #include <psapi.h>
 
+#ifndef _CONSOLE
+#define printf(...) {}
+#endif
+
 int main()
 {
     HANDLE hProcess = GetCurrentProcess();
@@ -33,20 +37,24 @@ int main()
             HANDLE hExplorer = OpenProcess(PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, TRUE, processList[i].ProcessId);
             if (!hExplorer) continue;
 
-            DWORD Needed;
-            HMODULE hMods[255];
+            DWORD cb, cbNeeded;
             WCHAR szModName[MAX_PATH];
-            EnumProcessModulesEx(hExplorer, hMods, sizeof(hMods), &Needed, LIST_MODULES_64BIT);
+            EnumProcessModulesEx(hExplorer, NULL, 0, &cb, LIST_MODULES_64BIT);
+            auto hMods = (HMODULE *)LocalAlloc(NONZEROLPTR, cb);
+            if (!hMods) continue;
+            EnumProcessModulesEx(hExplorer, hMods, cb, &cbNeeded, LIST_MODULES_64BIT);
+            if (cbNeeded < cb) cb = cbNeeded;
 
             HANDLE hModShell32 = INVALID_HANDLE_VALUE;
-            for (DWORD i = 0; i < Needed / sizeof(HMODULE); i++) {
+            for (DWORD i = 0; i < cb / sizeof(HMODULE); i++) {
                 if (!GetModuleFileNameExW(hExplorer, hMods[i], szModName, sizeof(szModName) / sizeof(WCHAR))) continue;
                 if (!lstrcmpiW(szModName, szShell32)) {
                     hModShell32 = hMods[i];
                     break;
                 }
             }
-            if (!hModShell32) continue;
+            LocalFree(hMods);
+            if (hModShell32 == INVALID_HANDLE_VALUE) continue;
 
             // and qword ptr [rdx], 0
             // and rax, 0
