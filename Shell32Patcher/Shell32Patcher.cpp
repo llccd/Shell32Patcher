@@ -3,58 +3,67 @@
 #include <Dbghelp.h>
 #include <wtsapi32.h>
 #include <psapi.h>
+#pragma comment(lib, "Dbghelp.lib")
+#pragma comment(lib, "Wtsapi32.lib")
 
 #ifndef _CONSOLE
 #define printf(...) {}
 #endif
 
+HMODULE GetModule(HANDLE hProcess, LPCWSTR target)
+{
+    DWORD cb, cbNeeded;
+    WCHAR szModName[MAX_PATH];
+    EnumProcessModulesEx(hProcess, NULL, 0, &cb, LIST_MODULES_64BIT);
+    auto hMods = (HMODULE*)LocalAlloc(NONZEROLPTR, cb);
+    if (!hMods) return NULL;
+    EnumProcessModulesEx(hProcess, hMods, cb, &cbNeeded, LIST_MODULES_64BIT);
+    if (cbNeeded < cb) cb = cbNeeded;
+
+    HMODULE hMod = NULL;
+    for (DWORD i = 0; i < cb / sizeof(HMODULE); i++) {
+        if (!GetModuleFileNameExW(hProcess, hMods[i], szModName, sizeof(szModName) / sizeof(WCHAR))) continue;
+        if (!lstrcmpiW(szModName, target)) {
+            hMod = hMods[i];
+            break;
+        }
+    }
+    LocalFree(hMods);
+    return hMod;
+}
+
 int main()
 {
-    HANDLE hProcess = GetCurrentProcess();
+    auto hProcess = GetCurrentProcess();
     SymSetOptions(SYMOPT_EXACT_SYMBOLS | SYMOPT_ALLOW_ABSOLUTE_SYMBOLS | SYMOPT_DEBUG | SYMOPT_UNDNAME);
-    const char* symPath = NULL;
-    GetEnvironmentVariableA("_NT_SYMBOL_PATH", NULL, 0);
-    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) symPath = "cache*;srv*https://msdl.microsoft.com/download/symbols";
-    if (!SymInitialize(hProcess, symPath, FALSE)) return -1;
+    LPCWSTR symPath = NULL;
+    GetEnvironmentVariableW(L"_NT_SYMBOL_PATH", NULL, 0);
+    if (GetLastError() == ERROR_ENVVAR_NOT_FOUND) symPath = L"cache*;srv*https://msdl.microsoft.com/download/symbols";
+    if (!SymInitializeW(hProcess, symPath, FALSE)) return -1;
 
     WCHAR szShell32[MAX_PATH];
     lstrcpyW(szShell32 + GetSystemDirectoryW(szShell32, sizeof(szShell32) / sizeof(WCHAR)), L"\\shell32.dll");
     if (!SymLoadModuleExW(hProcess, NULL, szShell32, NULL, 0, 0, NULL, 0)) return -2;
 
-    SYMBOL_INFO symbol;
-    symbol.SizeOfStruct = sizeof(SYMBOL_INFO);
+    SYMBOL_INFOW symbol;
+    symbol.SizeOfStruct = sizeof(SYMBOL_INFOW);
     symbol.MaxNameLen = 0;
-    if (!SymFromName(hProcess, "CDefView::TryGetContextMenuPresenter", &symbol)) return -3;
+    if (!SymFromNameW(hProcess, L"CDefView::TryGetContextMenuPresenter", &symbol)) return -3;
     printf("Found offset %llX\n", symbol.Address - symbol.ModBase);
 
     PWTS_PROCESS_INFOW processList;
     DWORD processCount = 0, pLevel = 0;
-    WTSEnumerateProcessesExW(WTS_CURRENT_SERVER_HANDLE, &pLevel, WTS_CURRENT_SESSION, (LPWSTR *)&processList, &processCount);
+    if(!WTSEnumerateProcessesExW(WTS_CURRENT_SERVER_HANDLE, &pLevel, WTS_CURRENT_SESSION, (LPWSTR *)&processList, &processCount))
+    	return -4;
 
     for (DWORD i = 0; i < processCount; i++) {
         if (!lstrcmpiW(processList[i].pProcessName, L"explorer.exe")) {
             printf("Found explorer PID:%u\n", processList[i].ProcessId);
-            HANDLE hExplorer = OpenProcess(PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, TRUE, processList[i].ProcessId);
+            auto hExplorer = OpenProcess(PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, TRUE, processList[i].ProcessId);
             if (!hExplorer) continue;
 
-            DWORD cb, cbNeeded;
-            WCHAR szModName[MAX_PATH];
-            EnumProcessModulesEx(hExplorer, NULL, 0, &cb, LIST_MODULES_64BIT);
-            auto hMods = (HMODULE *)LocalAlloc(NONZEROLPTR, cb);
-            if (!hMods) continue;
-            EnumProcessModulesEx(hExplorer, hMods, cb, &cbNeeded, LIST_MODULES_64BIT);
-            if (cbNeeded < cb) cb = cbNeeded;
-
-            HANDLE hModShell32 = INVALID_HANDLE_VALUE;
-            for (DWORD i = 0; i < cb / sizeof(HMODULE); i++) {
-                if (!GetModuleFileNameExW(hExplorer, hMods[i], szModName, sizeof(szModName) / sizeof(WCHAR))) continue;
-                if (!lstrcmpiW(szModName, szShell32)) {
-                    hModShell32 = hMods[i];
-                    break;
-                }
-            }
-            LocalFree(hMods);
-            if (hModShell32 == INVALID_HANDLE_VALUE) continue;
+            auto hModShell32 = GetModule(hExplorer, szShell32);
+            if (!hModShell32) continue;
 
             // and qword ptr [rdx], 0
             // and rax, 0
