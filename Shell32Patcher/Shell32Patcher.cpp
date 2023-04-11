@@ -48,17 +48,18 @@ DWORD64 searchXref(ZydisDecoder* decoder, DWORD64 base, PRUNTIME_FUNCTION func, 
 	auto IP = base + func->BeginAddress;
 	auto length = (ZyanUSize)func->EndAddress - func->BeginAddress;
 	ZydisDecodedInstruction instruction;
+	ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
 
-	while (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(decoder, (void*)IP, length, &instruction)))
+	while (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, (void*)IP, length, &instruction, operands)))
 	{
 		IP += instruction.length;
 		length -= instruction.length;
 		if (instruction.operand_count == 2 &&
 			instruction.mnemonic == ZYDIS_MNEMONIC_LEA &&
-			instruction.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-			instruction.operands[1].mem.base == ZYDIS_REGISTER_RIP &&
-			instruction.operands[1].mem.disp.value + IP == target + base &&
-			instruction.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
+			operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+			operands[1].mem.base == ZYDIS_REGISTER_RIP &&
+			operands[1].mem.disp.value + IP == target + base &&
+			operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER)
 			return IP - base;
 	}
 
@@ -70,6 +71,7 @@ HMODULE GetModule(HANDLE hProcess, LPCWSTR target)
 	DWORD cb, cbNeeded;
 	WCHAR szModName[MAX_PATH];
 	EnumProcessModulesEx(hProcess, NULL, 0, &cb, LIST_MODULES_64BIT);
+	if (GetLastError() != ERROR_ACCESS_DENIED) return NULL;
 	auto hMods = (HMODULE*)HeapAlloc(heap, 0, cb);
 	if (!hMods) return NULL;
 	EnumProcessModulesEx(hProcess, hMods, cb, &cbNeeded, LIST_MODULES_64BIT);
@@ -221,7 +223,7 @@ _Success_(return) BOOL CreateProtectedProcessAsUser(_In_ HANDLE token, _In_ LPWS
 DWORD64 getPatchOffset(DWORD64 base, DWORD64 target, PRUNTIME_FUNCTION funcTable, DWORD64 funcTableSize)
 {
 	ZydisDecoder decoder;
-	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_ADDRESS_WIDTH_64);
+	ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
 
 	for (DWORD i = 0; i < funcTableSize; i++) {
 		DWORD64 RVA = searchXref(&decoder, base, funcTable + i, target);
@@ -231,7 +233,7 @@ DWORD64 getPatchOffset(DWORD64 base, DWORD64 target, PRUNTIME_FUNCTION funcTable
 		auto length = (funcTable + i)->EndAddress - RVA;
 		ZydisDecodedInstruction instruction;
 
-		while (ZYAN_SUCCESS(ZydisDecoderDecodeBuffer(&decoder, (void*)IP, length, &instruction)))
+		while (ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&decoder, (ZydisDecoderContext *)0, (void*)IP, length, &instruction)))
 		{
 			if (instruction.length == 7 &&
 				instruction.mnemonic == ZYDIS_MNEMONIC_CALL)
@@ -261,7 +263,7 @@ HANDLE patch(DWORD64 offset)
 	return hFile;
 }
 
-int patchProcess(DWORD64 RVA, DWORD session)
+int patchProcess(DWORD64 RVA, DWORD session, bool patchAll)
 {
 	PWTS_PROCESS_INFOW processList;
 	DWORD processCount = 0, pLevel = 0;
@@ -269,7 +271,7 @@ int patchProcess(DWORD64 RVA, DWORD session)
 		EXIT("Cannot enumerate process", -25);
 
 	for (DWORD i = 0; i < processCount; i++) {
-		if (lstrcmpiW(processList[i].pProcessName, L"explorer.exe")) continue;
+		if (!patchAll && lstrcmpiW(processList[i].pProcessName, L"explorer.exe")) continue;
 		auto hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_VM_OPERATION | PROCESS_VM_WRITE, TRUE, processList[i].ProcessId);
 		if (!hProcess) continue;
 
@@ -283,7 +285,7 @@ int patchProcess(DWORD64 RVA, DWORD session)
 		}
 		CloseHandle(hProcess);
 	}
-	EXIT("Patch finised", 0);
+	EXIT("Patch finished", 0);
 }
 
 int main()
@@ -297,9 +299,13 @@ int main()
 	if (!argv) EXIT("CommandLineToArgv() Failed", 0x101);
 
 	bool persist = false;
-	for (int i = 1; i < argc; ++i)
+	bool patchAll = false;
+	for (int i = 1; i < argc; ++i) {
 		if (!lstrcmpiW(argv[i], L"-p"))
 			persist = true;
+		else if (!lstrcmpiW(argv[i], L"-a"))
+			patchAll = true;
+	}
 	LocalFree(argv);
 
 	lstrcpyW(szShell32 + GetSystemDirectoryW(szShell32, sizeof(szShell32) / sizeof(WCHAR)), L"\\shell32.dll");
@@ -327,11 +333,11 @@ int main()
 	auto rawOffset = RVA + pSection->PointerToRawData - pSection->VirtualAddress;
 
 	HANDLE token;
-	if (!OpenProcessToken(GetCurrentProcess(), MAXIMUM_ALLOWED, &token)) EXIT("Open token of CurrentProcess failed", - 7);
+	if (!OpenProcessToken(GetCurrentProcess(), MAXIMUM_ALLOWED, &token)) EXIT("Open token of CurrentProcess failed", -7);
 	enable_all_privileges(token);
 	CloseHandle(token);
 
-	if (!persist) return patchProcess(RVA, WTS_CURRENT_SESSION);
+	if (!persist) return patchProcess(RVA, WTS_CURRENT_SESSION, patchAll);
 
 	if (!ObjectManagerCreateSymlink(L"\\??\\GLOBALROOT", L"\\GLOBAL??")) EXIT("Create GLOBALROOT symlink failed", -8);
 
@@ -377,5 +383,5 @@ int main()
 	lstrcpyW(szServices + GetSystemDirectoryW(szServices, sizeof(szServices) / sizeof(WCHAR)), L"\\services.exe");
 	if (!CreateProtectedProcessAsUser(token, szServices, &hNewProcess)) EXIT("Start services.exe failed", -24);
 
-	return patchProcess(RVA, WTS_ANY_SESSION);
+	return patchProcess(RVA, WTS_ANY_SESSION, patchAll);
 }
